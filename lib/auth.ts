@@ -42,7 +42,6 @@ export const authOptions: NextAuthOptions = {
             'email',
             'profile',
             'https://www.googleapis.com/auth/gmail.readonly',
-            'https://www.googleapis.com/auth/spreadsheets.readonly',
           ].join(' '),
           access_type: 'offline',
           prompt: 'consent',
@@ -55,7 +54,6 @@ export const authOptions: NextAuthOptions = {
       return user.email === ALLOWED_EMAIL;
     },
     async jwt({ token, account }) {
-      // On initial sign-in, store tokens and expiry
       if (account) {
         console.log('[NextAuth] Initial sign-in — storing access token, refresh token, expiry');
         return {
@@ -66,13 +64,11 @@ export const authOptions: NextAuthOptions = {
         };
       }
 
-      // Token is still valid
       const expiresAt = token.expiresAt as number | undefined;
       if (expiresAt && Date.now() / 1000 < expiresAt - 60) {
         return token;
       }
 
-      // Token has expired — refresh it
       const refreshToken = token.refreshToken as string | undefined;
       if (!refreshToken) {
         console.error('[NextAuth] No refresh token available — cannot refresh');

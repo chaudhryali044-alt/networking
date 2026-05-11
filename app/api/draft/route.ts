@@ -18,13 +18,8 @@ export async function POST(req: NextRequest) {
 
   if (!contact) return NextResponse.json({ error: 'Contact not found' }, { status: 404 });
 
-  const snippets = contact.thread_snippet ? [contact.thread_snippet] : [];
-  const draft = await draftEmail(
-    contact.name,
-    contact.company ?? '',
-    snippets,
-    contact.ai_summary ?? ''
-  );
+  const snippets = [contact.thread_snippet, contact.ai_summary].filter(Boolean) as string[];
+  const draft = await draftEmail(contact.name, contact.company ?? '', snippets);
 
   if (!draft) {
     return NextResponse.json({ error: 'Failed to generate draft' }, { status: 500 });

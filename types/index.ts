@@ -1,10 +1,14 @@
 export type TrueStatus =
+  | 'Meeting Confirmed'
+  | 'Active'
+  | 'Replied — Follow Up Needed'
+  | 'Awaiting Reply'
+  | 'No Response'
+  | 'Gone Cold'
+  // Legacy
   | 'Recent Meeting'
   | 'Meeting Had — Follow Up'
   | 'Needs Response'
-  | 'Awaiting Reply'
-  | 'Gone Cold'
-  | 'No Response'
   | 'Opportunity Active'
   | 'Unverified';
 
