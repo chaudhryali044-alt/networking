@@ -10,9 +10,18 @@ const SPREADSHEET_ID = process.env.SPREADSHEET_ID!;
 const CACHE_HOURS = 6;
 
 export async function POST(req: NextRequest) {
-  console.log('[Sync] POST /api/sync — starting');
+  console.log('Sync route hit');
 
   const session = await getServerSession(authOptions);
+  console.log('Session:', JSON.stringify({
+    exists: !!session,
+    email: session?.user?.email ?? null,
+    hasAccessToken: !!session?.accessToken,
+    tokenLength: session?.accessToken?.length ?? 0,
+    error: session?.error ?? null,
+  }));
+
+  console.log('[Sync] POST /api/sync — starting');
 
   if (!session) {
     console.log('[Sync] No session found — returning 401');
@@ -276,6 +285,7 @@ export async function POST(req: NextRequest) {
 }
 
 export async function GET() {
+  console.log('Sync route hit');
   console.log('[Sync] GET /api/sync — fetching last sync status');
 
   try {
@@ -288,14 +298,14 @@ export async function GET() {
 
     if (error) {
       console.error('[Sync] GET sync_log error:', error);
-      return NextResponse.json({ lastSync: null, error: error.message });
+      return NextResponse.json({ status: 'sync route alive', lastSync: null, error: error.message });
     }
 
     console.log('[Sync] Last sync:', data?.synced_at ?? 'never');
-    return NextResponse.json({ lastSync: data });
+    return NextResponse.json({ status: 'sync route alive', lastSync: data });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[Sync] GET error:', msg);
-    return NextResponse.json({ lastSync: null, error: msg });
+    return NextResponse.json({ status: 'sync route alive', lastSync: null, error: msg });
   }
 }

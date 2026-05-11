@@ -23,11 +23,21 @@ export default function Sidebar() {
     fetch('/api/sync')
       .then(r => r.json())
       .then(d => {
-        if (d.lastSync?.synced_at) {
-          setLastSynced(d.lastSync.synced_at);
+        const lastSyncTime = d.lastSync?.synced_at ?? null;
+        if (lastSyncTime) {
+          setLastSynced(lastSyncTime);
+          // Auto-sync if last sync was more than 6 hours ago
+          const hoursSince = (Date.now() - new Date(lastSyncTime).getTime()) / 3_600_000;
+          if (hoursSince > 6) {
+            handleSync();
+          }
+        } else {
+          // Never synced — trigger automatically on first load
+          handleSync();
         }
       })
       .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleSync = async () => {
