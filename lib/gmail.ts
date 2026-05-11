@@ -23,6 +23,20 @@ function hasMeetingSignal(text: string): boolean {
   return signals.some(s => lower.includes(s));
 }
 
+export async function verifyGmailAccess(
+  gmail: ReturnType<typeof getGmailClient>
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await gmail.users.getProfile({ userId: 'me' });
+    console.log('[Gmail] Auth OK — inbox address:', res.data.emailAddress);
+    return { ok: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[Gmail] Auth check FAILED:', msg);
+    return { ok: false, error: msg };
+  }
+}
+
 export async function getThreadsForEmail(
   gmail: ReturnType<typeof getGmailClient>,
   contactEmail: string,
@@ -93,30 +107,12 @@ export async function getThreadsForEmail(
         if (date) result.meetingDate = date;
       }
     }
-  } catch {
-    // Return empty result on error
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[Gmail] ERROR fetching threads for ${contactEmail}:`, msg);
   }
 
   return result;
-}
-
-export async function searchOutreachEmails(
-  gmail: ReturnType<typeof getGmailClient>
-): Promise<{ count: number }> {
-  try {
-    const queries = [
-      'from:me ("Brief Introduction" OR "Thank you for inspiring") newer_than:10m',
-      'subject:(interview OR coffee OR call OR schedule) newer_than:10m',
-    ];
-    let count = 0;
-    for (const q of queries) {
-      const res = await gmail.users.messages.list({ userId: 'me', q, maxResults: 100 });
-      count += (res.data.messages ?? []).length;
-    }
-    return { count };
-  } catch {
-    return { count: 0 };
-  }
 }
 
 export function computeTrueStatus(

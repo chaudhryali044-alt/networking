@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import { getSheetsClient, readAllContacts } from '@/lib/sheets';
-import { getGmailClient, getThreadsForEmail, computeTrueStatus } from '@/lib/gmail';
+import { getGmailClient, getThreadsForEmail, computeTrueStatus, verifyGmailAccess } from '@/lib/gmail';
 import { analyzeThread } from '@/lib/gemini';
 import { supabase } from '@/lib/supabase';
 
@@ -18,7 +18,6 @@ export async function POST(req: NextRequest) {
   console.log('Access token present:', !!session?.accessToken);
 
   if (!session) {
-    console.log('[Sync] No session — returning 401');
     return NextResponse.json({ error: 'Not authenticated. Please sign in.' }, { status: 401 });
   }
 
@@ -33,7 +32,6 @@ export async function POST(req: NextRequest) {
   const accessToken = session.accessToken;
 
   if (!accessToken) {
-    console.log('[Sync] No access token in session');
     return NextResponse.json(
       { error: 'No access token — please sign out and sign in again' },
       { status: 401 }
@@ -42,15 +40,13 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => ({ force: false }));
   const force = body?.force ?? false;
-  console.log('[Sync] Force sync:', force);
 
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
     async start(controller) {
       const send = (step: string, detail?: string) => {
-        const msg = detail ? `${step} — ${detail}` : step;
-        console.log('[Sync]', msg);
+        console.log('[Sync]', step, detail ?? '');
         controller.enqueue(encoder.encode(JSON.stringify({ step, detail }) + '\n'));
       };
 
@@ -63,7 +59,7 @@ export async function POST(req: NextRequest) {
       };
 
       try {
-        send('Reading spreadsheet...');
+        console.log('Reading spreadsheet ID:', SPREADSHEET_ID);
 
         if (!SPREADSHEET_ID) {
           sendError('SPREADSHEET_ID env var is not set');
@@ -71,19 +67,36 @@ export async function POST(req: NextRequest) {
           return;
         }
 
+        // Gmail auth check
+        console.log('Fetching Gmail...');
+        const gmail = getGmailClient(accessToken);
+        const gmailCheck = await verifyGmailAccess(gmail);
+        console.log('Gmail response:', JSON.stringify(gmailCheck).slice(0, 200));
+
+        if (!gmailCheck.ok) {
+          sendError('Gmail access failed — token may be missing gmail.readonly scope', gmailCheck.error);
+        }
+
+        // Read Google Sheets
+        send('Reading spreadsheet...');
+        console.log('Fetching sheets data...');
+
         const sheets = getSheetsClient(accessToken);
         let sheetContacts: Awaited<ReturnType<typeof readAllContacts>> = [];
 
         try {
           sheetContacts = await readAllContacts(sheets, SPREADSHEET_ID);
+          console.log('Sheets response: contacts found:', sheetContacts.length,
+            '| first:', JSON.stringify(sheetContacts[0] ?? null).slice(0, 200));
           send('Spreadsheet read', `${sheetContacts.length} contacts found`);
         } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error('Sheets response: ERROR:', msg);
           sendError('Failed to read Google Sheets', err);
           sheetContacts = [];
         }
 
-        send('Scanning Gmail (last 10 months)...');
-        const gmail = getGmailClient(accessToken);
+        send('Scanning Gmail threads...');
 
         let gmailThreadsRead = 0;
         const processed: Record<string, unknown>[] = [];
@@ -93,7 +106,7 @@ export async function POST(req: NextRequest) {
 
         for (let i = 0; i < sheetContacts.length; i++) {
           const contact = sheetContacts[i];
-          send(`Analysing contact ${i + 1}/${sheetContacts.length}`, contact.name);
+          send(`Analysing ${i + 1}/${sheetContacts.length}`, contact.name);
 
           if (!force && contact.email) {
             try {
@@ -115,24 +128,13 @@ export async function POST(req: NextRequest) {
           }
 
           let threadInfo = null;
-          if (contact.email) {
+          if (contact.email && gmailCheck.ok) {
             try {
-              threadInfo = await getThreadsForEmail(
-                gmail,
-                contact.email,
-                'chaudhry.ali044@gmail.com'
-              );
+              threadInfo = await getThreadsForEmail(gmail, contact.email, 'chaudhry.ali044@gmail.com');
               gmailThreadsRead++;
-              console.log(
-                '[Sync] Gmail for', contact.name,
-                '— sent:', threadInfo.emailsSent,
-                'received:', threadInfo.emailsReceived
-              );
             } catch (err) {
               console.warn('[Sync] Gmail lookup failed for', contact.name, err);
             }
-          } else {
-            console.log('[Sync] No email for', contact.name, '— skipping Gmail');
           }
 
           const trueStatus = threadInfo
@@ -148,13 +150,9 @@ export async function POST(req: NextRequest) {
             Date.now() - threadInfo.lastContactDate.getTime() < 60 * 24 * 60 * 60 * 1000;
 
           if (hasRecentActivity && threadInfo && threadInfo.snippets.length > 0) {
-            send(`Generating AI summary for ${contact.name}...`);
+            send(`AI summary for ${contact.name}...`);
             try {
-              const analysis = await analyzeThread(
-                contact.name,
-                contact.company ?? '',
-                threadInfo.snippets
-              );
+              const analysis = await analyzeThread(contact.name, contact.company ?? '', threadInfo.snippets);
               if (analysis) {
                 aiSummary = analysis.summary;
                 nextAction = analysis.nextAction;
@@ -188,21 +186,20 @@ export async function POST(req: NextRequest) {
           });
         }
 
-        const toSave = processed.filter((c) => !c._cached);
-        send(`Saving ${toSave.length} contacts to database...`);
-        console.log('[Sync] Upserting', toSave.length, 'contacts to Supabase');
+        const toSave = processed.filter(c => !c._cached);
+        send(`Saving ${toSave.length} contacts...`);
+        console.log('[Sync] Upserting', toSave.length, 'contacts (cached:', processed.length - toSave.length, ')');
 
         if (toSave.length > 0) {
-          const withEmail = toSave.filter((c) => c.email);
-          const withoutEmail = toSave.filter((c) => !c.email);
+          const withEmail = toSave.filter(c => c.email);
+          const withoutEmail = toSave.filter(c => !c.email);
 
           if (withEmail.length > 0) {
             const { error: upsertErr } = await supabase
               .from('contacts')
               .upsert(withEmail, { onConflict: 'email', ignoreDuplicates: false });
-
             if (upsertErr) {
-              console.error('[Sync] Upsert (with email) error:', upsertErr);
+              console.error('[Sync] Upsert error:', upsertErr.message);
               sendError('Supabase upsert error', upsertErr.message);
             } else {
               console.log('[Sync] Upserted', withEmail.length, 'contacts with email');
@@ -210,12 +207,9 @@ export async function POST(req: NextRequest) {
           }
 
           if (withoutEmail.length > 0) {
-            const { error: insertErr } = await supabase
-              .from('contacts')
-              .insert(withoutEmail);
-
+            const { error: insertErr } = await supabase.from('contacts').insert(withoutEmail);
             if (insertErr) {
-              console.warn('[Sync] Insert (without email) error (may be duplicate):', insertErr.message);
+              console.warn('[Sync] Insert (no email) error:', insertErr.message);
             } else {
               console.log('[Sync] Inserted', withoutEmail.length, 'contacts without email');
             }
@@ -227,31 +221,19 @@ export async function POST(req: NextRequest) {
           gmail_threads_read: gmailThreadsRead,
           status: 'success',
         });
+        if (logErr) console.error('[Sync] Failed to write sync_log:', logErr.message);
 
-        if (logErr) {
-          console.error('[Sync] Failed to write sync_log:', logErr);
-        }
-
-        const summary = `${processed.length} contacts processed, ${gmailThreadsRead} Gmail threads read`;
+        const summary = `${processed.length} contacts, ${gmailThreadsRead} Gmail threads`;
         send('Sync complete!', summary);
         console.log('[Sync] Done —', summary);
 
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error('[Sync] Unhandled error:', err);
-        controller.enqueue(
-          encoder.encode(JSON.stringify({ step: 'Error', detail: msg }) + '\n')
-        );
-
+        console.error('[Sync] Unhandled error:', msg);
+        controller.enqueue(encoder.encode(JSON.stringify({ step: 'Error', detail: msg }) + '\n'));
         try {
-          await supabase.from('sync_log').insert({
-            contacts_processed: 0,
-            gmail_threads_read: 0,
-            status: `error: ${msg}`,
-          });
-        } catch (logErr) {
-          console.error('[Sync] Could not write error to sync_log:', logErr);
-        }
+          await supabase.from('sync_log').insert({ contacts_processed: 0, gmail_threads_read: 0, status: `error: ${msg}` });
+        } catch { /* ignore */ }
       }
 
       controller.close();
@@ -268,8 +250,6 @@ export async function POST(req: NextRequest) {
 
 export async function GET() {
   console.log('Sync route hit');
-  console.log('[Sync] GET /api/sync — fetching last sync status');
-
   try {
     const { data, error } = await supabase
       .from('sync_log')
@@ -279,15 +259,12 @@ export async function GET() {
       .maybeSingle();
 
     if (error) {
-      console.error('[Sync] GET sync_log error:', error);
+      console.error('[Sync] GET sync_log error:', error.message);
       return NextResponse.json({ status: 'sync route alive', lastSync: null, error: error.message });
     }
-
-    console.log('[Sync] Last sync:', data?.synced_at ?? 'never');
     return NextResponse.json({ status: 'sync route alive', lastSync: data });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error('[Sync] GET error:', msg);
     return NextResponse.json({ status: 'sync route alive', lastSync: null, error: msg });
   }
 }
