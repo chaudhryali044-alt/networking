@@ -108,18 +108,21 @@ export async function POST(req: NextRequest) {
           const contact = sheetContacts[i];
           send(`Analysing ${i + 1}/${sheetContacts.length}`, contact.name);
 
-          if (!force && contact.email) {
+          if (!force) {
             try {
-              const { data: cached } = await supabase
+              let cacheQuery = supabase
                 .from('contacts')
                 .select('id, last_synced')
-                .eq('email', contact.email)
-                .gte('last_synced', cacheThreshold)
-                .maybeSingle();
+                .eq('name', contact.name)
+                .gte('last_synced', cacheThreshold);
+              if (contact.company) {
+                cacheQuery = cacheQuery.eq('company', contact.company);
+              }
+              const { data: cached } = await cacheQuery.maybeSingle();
 
               if (cached) {
                 console.log('[Sync] Cache hit for', contact.name);
-                processed.push({ _cached: true, email: contact.email });
+                processed.push({ _cached: true });
                 continue;
               }
             } catch (err) {
@@ -128,13 +131,24 @@ export async function POST(req: NextRequest) {
           }
 
           let threadInfo = null;
-          if (contact.email && gmailCheck.ok) {
-            try {
-              threadInfo = await getThreadsForEmail(gmail, contact.email, 'chaudhry.ali044@gmail.com');
-              gmailThreadsRead++;
-            } catch (err) {
-              console.warn('[Sync] Gmail lookup failed for', contact.name, err);
+          if (contact.email) {
+            if (!gmailCheck.ok) {
+              console.warn('[Sync] Skipping Gmail for', contact.name, '— Gmail auth failed');
+            } else {
+              try {
+                console.log(`[Gmail] Fetching threads for ${contact.name} <${contact.email}>`);
+                threadInfo = await getThreadsForEmail(gmail, contact.email, 'chaudhry.ali044@gmail.com');
+                gmailThreadsRead++;
+                console.log(
+                  `[Gmail] ${contact.name}: sent=${threadInfo.emailsSent} received=${threadInfo.emailsReceived}`,
+                  `meeting=${threadInfo.meetingHappened} snippets=${threadInfo.snippets.length}`
+                );
+              } catch (err) {
+                console.warn('[Gmail] Lookup failed for', contact.name, err instanceof Error ? err.message : err);
+              }
             }
+          } else {
+            console.log(`[Gmail] No email for ${contact.name} — skipping`);
           }
 
           const trueStatus = threadInfo
@@ -186,33 +200,24 @@ export async function POST(req: NextRequest) {
           });
         }
 
+        // ── Save to Supabase ─────────────────────────────────────────────
         const toSave = processed.filter(c => !c._cached);
         send(`Saving ${toSave.length} contacts...`);
         console.log('[Sync] Upserting', toSave.length, 'contacts (cached:', processed.length - toSave.length, ')');
 
         if (toSave.length > 0) {
-          const withEmail = toSave.filter(c => c.email);
-          const withoutEmail = toSave.filter(c => !c.email);
+          // Upsert all contacts using name+company as the unique conflict key.
+          // Requires unique constraint: ALTER TABLE contacts ADD CONSTRAINT
+          // contacts_name_company_unique UNIQUE (name, company);
+          const { error: upsertErr } = await supabase
+            .from('contacts')
+            .upsert(toSave, { onConflict: 'name,company', ignoreDuplicates: false });
 
-          if (withEmail.length > 0) {
-            const { error: upsertErr } = await supabase
-              .from('contacts')
-              .upsert(withEmail, { onConflict: 'email', ignoreDuplicates: false });
-            if (upsertErr) {
-              console.error('[Sync] Upsert error:', upsertErr.message);
-              sendError('Supabase upsert error', upsertErr.message);
-            } else {
-              console.log('[Sync] Upserted', withEmail.length, 'contacts with email');
-            }
-          }
-
-          if (withoutEmail.length > 0) {
-            const { error: insertErr } = await supabase.from('contacts').insert(withoutEmail);
-            if (insertErr) {
-              console.warn('[Sync] Insert (no email) error:', insertErr.message);
-            } else {
-              console.log('[Sync] Inserted', withoutEmail.length, 'contacts without email');
-            }
+          if (upsertErr) {
+            console.error('[Sync] Upsert error:', upsertErr.message);
+            sendError('Supabase upsert error', upsertErr.message);
+          } else {
+            console.log('[Sync] Upserted', toSave.length, 'contacts (conflict key: name,company)');
           }
         }
 
