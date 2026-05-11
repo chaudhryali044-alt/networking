@@ -10,26 +10,20 @@ const SPREADSHEET_ID = process.env.SPREADSHEET_ID!;
 const CACHE_HOURS = 6;
 
 export async function POST(req: NextRequest) {
-  console.log('Sync route hit');
+  console.log('Sync started');
 
   const session = await getServerSession(authOptions);
-  console.log('Session:', JSON.stringify({
-    exists: !!session,
-    email: session?.user?.email ?? null,
-    hasAccessToken: !!session?.accessToken,
-    tokenLength: session?.accessToken?.length ?? 0,
-    error: session?.error ?? null,
-  }));
 
-  console.log('[Sync] POST /api/sync — starting');
+  console.log('Session:', session?.user?.email ?? null);
+  console.log('Access token present:', !!session?.accessToken);
 
   if (!session) {
-    console.log('[Sync] No session found — returning 401');
+    console.log('[Sync] No session — returning 401');
     return NextResponse.json({ error: 'Not authenticated. Please sign in.' }, { status: 401 });
   }
 
   if (session.error === 'RefreshAccessTokenError' || session.error === 'RefreshTokenMissing') {
-    console.log('[Sync] Session has token error:', session.error);
+    console.log('[Sync] Token error:', session.error);
     return NextResponse.json(
       { error: 'Google OAuth token expired. Please sign out and sign in again.' },
       { status: 401 }
@@ -37,12 +31,11 @@ export async function POST(req: NextRequest) {
   }
 
   const accessToken = session.accessToken;
-  console.log('[Sync] Got access token:', accessToken ? 'YES (length ' + accessToken.length + ')' : 'NO');
 
   if (!accessToken) {
-    console.log('[Sync] No access token in session — check NextAuth jwt/session callbacks');
+    console.log('[Sync] No access token in session');
     return NextResponse.json(
-      { error: 'No Google access token. Please sign out and sign in again to grant permissions.' },
+      { error: 'No access token — please sign out and sign in again' },
       { status: 401 }
     );
   }
@@ -70,7 +63,6 @@ export async function POST(req: NextRequest) {
       };
 
       try {
-        // ── STEP 1: Read Google Sheets ──────────────────────────────
         send('Reading spreadsheet...');
 
         if (!SPREADSHEET_ID) {
@@ -87,11 +79,9 @@ export async function POST(req: NextRequest) {
           send('Spreadsheet read', `${sheetContacts.length} contacts found`);
         } catch (err) {
           sendError('Failed to read Google Sheets', err);
-          // Continue with empty list so Gmail scan still logs
           sheetContacts = [];
         }
 
-        // ── STEP 2: Initialise Gmail ────────────────────────────────
         send('Scanning Gmail (last 10 months)...');
         const gmail = getGmailClient(accessToken);
 
@@ -99,14 +89,12 @@ export async function POST(req: NextRequest) {
         const processed: Record<string, unknown>[] = [];
         const cacheThreshold = new Date(Date.now() - CACHE_HOURS * 3600 * 1000).toISOString();
 
-        // ── STEP 3: Process each contact ───────────────────────────
         send('Processing contacts...', `${sheetContacts.length} total`);
 
         for (let i = 0; i < sheetContacts.length; i++) {
           const contact = sheetContacts[i];
           send(`Analysing contact ${i + 1}/${sheetContacts.length}`, contact.name);
 
-          // Check cache (only for contacts with an email address)
           if (!force && contact.email) {
             try {
               const { data: cached } = await supabase
@@ -126,7 +114,6 @@ export async function POST(req: NextRequest) {
             }
           }
 
-          // ── Gmail lookup ──────────────────────────────────────────
           let threadInfo = null;
           if (contact.email) {
             try {
@@ -152,7 +139,6 @@ export async function POST(req: NextRequest) {
             ? computeTrueStatus(threadInfo, contact.status)
             : (contact.status ?? 'Unverified');
 
-          // ── AI summary (active threads only) ─────────────────────
           let aiSummary: string | null = null;
           let nextAction: string | null = null;
           let urgency: string | null = null;
@@ -202,13 +188,11 @@ export async function POST(req: NextRequest) {
           });
         }
 
-        // ── STEP 4: Save to Supabase ────────────────────────────────
         const toSave = processed.filter((c) => !c._cached);
         send(`Saving ${toSave.length} contacts to database...`);
         console.log('[Sync] Upserting', toSave.length, 'contacts to Supabase');
 
         if (toSave.length > 0) {
-          // Split into contacts with email (upsert) and without (insert or name+company upsert)
           const withEmail = toSave.filter((c) => c.email);
           const withoutEmail = toSave.filter((c) => !c.email);
 
@@ -226,7 +210,6 @@ export async function POST(req: NextRequest) {
           }
 
           if (withoutEmail.length > 0) {
-            // For contacts without email, use insert and ignore conflicts
             const { error: insertErr } = await supabase
               .from('contacts')
               .insert(withoutEmail);
@@ -239,7 +222,6 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        // ── STEP 5: Log the sync ────────────────────────────────────
         const { error: logErr } = await supabase.from('sync_log').insert({
           contacts_processed: processed.length,
           gmail_threads_read: gmailThreadsRead,
