@@ -64,3 +64,17 @@ export interface DiscoverSuggestion {
   reason: string;
   outreachAngle: string;
 }
+
+export interface GmailThread {
+  id: string;
+  thread_id: string;
+  subject: string | null;
+  from_address: string | null;
+  to_address: string | null;
+  latest_date: string | null;
+  snippet: string | null;
+  has_reply: boolean;
+  contact_email: string | null;
+  contact_name: string | null;
+  synced_at: string;
+}

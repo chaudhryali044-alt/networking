@@ -6,21 +6,14 @@ export function getGmailClient(accessToken: string) {
   return google.gmail({ version: 'v1', auth });
 }
 
-export interface ThreadInfo {
-  email: string;
-  firstContactDate: Date | null;
-  lastContactDate: Date | null;
-  emailsSent: number;
-  emailsReceived: number;
-  meetingHappened: boolean;
-  meetingDate: Date | null;
-  snippets: string[];
-}
-
-function hasMeetingSignal(text: string): boolean {
-  const signals = ['zoom.us', 'teams.microsoft.com', 'meet.google.com', 'calendar.google.com', 'calendly.com', 'interview', 'coffee chat', 'call scheduled', 'meeting scheduled'];
-  const lower = text.toLowerCase();
-  return signals.some(s => lower.includes(s));
+export interface GmailThreadSummary {
+  threadId: string;
+  subject: string;
+  fromAddress: string;
+  toAddress: string;
+  latestDate: Date | null;
+  snippet: string;
+  hasReply: boolean;
 }
 
 export async function verifyGmailAccess(
@@ -37,121 +30,77 @@ export async function verifyGmailAccess(
   }
 }
 
-export async function getThreadsForEmail(
+export async function getThreadSummariesForEmail(
   gmail: ReturnType<typeof getGmailClient>,
   contactEmail: string,
   userEmail: string
-): Promise<ThreadInfo> {
-  const result: ThreadInfo = {
-    email: contactEmail,
-    firstContactDate: null,
-    lastContactDate: null,
-    emailsSent: 0,
-    emailsReceived: 0,
-    meetingHappened: false,
-    meetingDate: null,
-    snippets: [],
-  };
+): Promise<GmailThreadSummary[]> {
+  const summaries: GmailThreadSummary[] = [];
+  const seenThreadIds = new Set<string>();
 
-  try {
-    const queries = [
-      `to:${contactEmail} newer_than:10m`,
-      `from:${contactEmail} newer_than:10m`,
-    ];
+  const queries = [
+    `to:${contactEmail} newer_than:10m`,
+    `from:${contactEmail} newer_than:10m`,
+  ];
 
-    const messageIds = new Set<string>();
-
-    for (const q of queries) {
-      const res = await gmail.users.messages.list({
-        userId: 'me',
-        q,
-        maxResults: 20,
-      });
-      for (const msg of res.data.messages ?? []) {
-        if (msg.id) messageIds.add(msg.id);
-      }
+  for (const q of queries) {
+    let listRes;
+    try {
+      listRes = await gmail.users.threads.list({ userId: 'me', q, maxResults: 10 });
+    } catch (err) {
+      console.warn('[Gmail] threads.list failed for "' + q + '":', err instanceof Error ? err.message : err);
+      continue;
     }
 
-    for (const id of messageIds) {
-      const msg = await gmail.users.messages.get({
-        userId: 'me',
-        id,
-        format: 'metadata',
-        metadataHeaders: ['From', 'To', 'Date', 'Subject'],
-      });
+    for (const thread of listRes.data.threads ?? []) {
+      if (!thread.id || seenThreadIds.has(thread.id)) continue;
+      seenThreadIds.add(thread.id);
 
-      const headers = msg.data.payload?.headers ?? [];
-      const from = headers.find(h => h.name === 'From')?.value ?? '';
-      const dateStr = headers.find(h => h.name === 'Date')?.value ?? '';
-      const snippet = msg.data.snippet ?? '';
+      try {
+        const threadData = await gmail.users.threads.get({
+          userId: 'me',
+          id: thread.id,
+          format: 'metadata',
+          metadataHeaders: ['From', 'To', 'Subject', 'Date'],
+        });
 
-      const date = dateStr ? new Date(dateStr) : null;
-      if (date && !isNaN(date.getTime())) {
-        if (!result.firstContactDate || date < result.firstContactDate) result.firstContactDate = date;
-        if (!result.lastContactDate || date > result.lastContactDate) result.lastContactDate = date;
-      }
+        const messages = threadData.data.messages ?? [];
+        if (messages.length === 0) continue;
 
-      const isFromMe = from.includes(userEmail);
-      if (isFromMe) {
-        result.emailsSent++;
-      } else {
-        result.emailsReceived++;
-      }
+        const firstHeaders = messages[0].payload?.headers ?? [];
+        const subject = firstHeaders.find(h => h.name === 'Subject')?.value ?? '(no subject)';
+        const fromAddress = firstHeaders.find(h => h.name === 'From')?.value ?? '';
+        const toAddress = firstHeaders.find(h => h.name === 'To')?.value ?? '';
 
-      if (snippet && result.snippets.length < 5) {
-        result.snippets.push(snippet);
-      }
+        const lastMsg = messages[messages.length - 1];
+        const lastHeaders = lastMsg.payload?.headers ?? [];
+        const latestDateStr = lastHeaders.find(h => h.name === 'Date')?.value ?? '';
+        const latestDate = latestDateStr ? new Date(latestDateStr) : null;
+        const snippet = lastMsg.snippet ?? '';
 
-      if (hasMeetingSignal(snippet)) {
-        result.meetingHappened = true;
-        if (date) result.meetingDate = date;
+        const hasFromMe = messages.some(m =>
+          (m.payload?.headers?.find(h => h.name === 'From')?.value ?? '').includes(userEmail)
+        );
+        const hasFromContact = messages.some(m =>
+          (m.payload?.headers?.find(h => h.name === 'From')?.value ?? '')
+            .toLowerCase()
+            .includes(contactEmail.toLowerCase())
+        );
+
+        summaries.push({
+          threadId: thread.id,
+          subject,
+          fromAddress,
+          toAddress,
+          latestDate: latestDate && !isNaN(latestDate.getTime()) ? latestDate : null,
+          snippet,
+          hasReply: hasFromMe && hasFromContact,
+        });
+      } catch (err) {
+        console.warn('[Gmail] threads.get failed for ' + thread.id + ':', err instanceof Error ? err.message : err);
       }
     }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[Gmail] ERROR fetching threads for ${contactEmail}:`, msg);
   }
 
-  return result;
-}
-
-export function computeTrueStatus(
-  info: ThreadInfo,
-  spreadsheetStatus: string | null
-): string {
-  const now = new Date();
-  const daysSinceLastContact = info.lastContactDate
-    ? Math.floor((now.getTime() - info.lastContactDate.getTime()) / (1000 * 60 * 60 * 24))
-    : null;
-
-  if (info.meetingHappened && info.meetingDate) {
-    const daysSinceMeeting = Math.floor((now.getTime() - info.meetingDate.getTime()) / (1000 * 60 * 60 * 24));
-    if (daysSinceMeeting <= 30) return 'Recent Meeting';
-    return 'Meeting Had — Follow Up';
-  }
-
-  if (!info.firstContactDate) {
-    return spreadsheetStatus ?? 'Unverified';
-  }
-
-  const lastWasFromThem = info.emailsReceived > 0 &&
-    info.lastContactDate &&
-    info.emailsSent > 0;
-
-  if (lastWasFromThem && daysSinceLastContact !== null && daysSinceLastContact > 14) {
-    return 'Needs Response';
-  }
-
-  if (info.emailsSent > 0 && info.emailsReceived === 0) {
-    if (daysSinceLastContact !== null && daysSinceLastContact >= 30) return 'Gone Cold';
-    if (daysSinceLastContact !== null && daysSinceLastContact >= 14) return 'Awaiting Reply';
-    return 'No Response';
-  }
-
-  if (info.emailsSent > 0 && info.emailsReceived > 0) {
-    if (daysSinceLastContact !== null && daysSinceLastContact >= 30) return 'Gone Cold';
-    return 'Awaiting Reply';
-  }
-
-  return spreadsheetStatus ?? 'Unverified';
+  return summaries;
 }
